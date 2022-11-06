@@ -50,7 +50,7 @@ class Database(SmartPlugin):
     """
 
     ALLOW_MULTIINSTANCE = True
-    PLUGIN_VERSION = '1.6.3'
+    PLUGIN_VERSION = '1.6.4'
 
     # SQL queries: {item} = item table name, {log} = log table name
     # time, item_id, val_str, val_num, val_bool, changed
@@ -857,34 +857,51 @@ class Database(SmartPlugin):
         order = '' if func + '.order' not in queries else queries[func + '.order']
         group = 'GROUP BY ROUND(time / :step)' if func + '.group' not in queries else queries[func + '.group']
         logs = self._fetch_log(item, queries[func], start, end, step=step, count=count, group=group, order=order)
+        # create tuples containing regular series data from DB query
         tuples = logs['tuples']
+        # create tuples_extended containing special datapoints such as
+        # the current value at index 0.
+        tuples_extended = []
+
+        # Analyse this section:
+        sample_interval = (logs['iend'] - logs['istart']) / int(count)
+        self.logger.warning(f"DEBUG 1 _series: sample_interval {sample_interval}, logs['istart'] {logs['istart']}, logs['iend'] {logs['iend']}, count {count}")
+
         if tuples:
             if logs['istart'] > tuples[0][0]:
+                self.logger.warning(f"DEBUG 2a _series: item={item}, overwriting first tuple[0] from ({tuples[0][1]},{tuples[0][1]}) to ({logs['istart']}, {tuples[0][1]})")
                 tuples[0] = (logs['istart'], tuples[0][1])
             if end != 'now':
+                self.logger.warning(f"DEBUG 2b _series: item={item}, adding tuple ({logs['iend']}, {tuples[-1][1]})")
                 tuples.append((logs['iend'], tuples[-1][1]))
         else:
             tuples = []
+
+        # To complete the series, append the current value to extended tuples if item change is within
+        # the request interval (istart, iend)
         item_change = self._timestamp(logs['item'].last_change())
         if item_change < logs['iend']:
             value = float(logs['item']())
             if item_change < logs['istart']:
-                tuples.append((logs['istart'], value))
+                #tuples.append((logs['istart'], value))
+                tuples_extended.append((logs['istart'], value))
             elif init:
-                tuples.append((item_change, value))
+                #tuples.append((item_change, value))
+                tuples_extended.append((item_change, value))
             if init:
-                tuples.append((logs['iend'], value))
+                #tuples.append((logs['iend'], value))
+                tuples_extended.append((logs['iend'], value))
 
         if expression['finalizer']:
-            tuples = self._finalize(expression['finalizer'], tuples)
+            tuples = self._finalize(expression['finalizer'], tuples, tuples_extended)
 
         result = {
-            'cmd': 'series', 'series': tuples, 'sid': sid,
+            'cmd': 'series', 'series': tuples, 'series_ext': tuples_extended, 'sid': sid,
             'params': {'update': True, 'item': item, 'func': func, 'start': logs['iend'], 'end': end,
                        'step': logs['step'], 'sid': sid},
             'update': self.shtime.now() + datetime.timedelta(seconds=int(logs['step'] / 1000))
         }
-        #self.logger.warning("_series: result={}".format(result))
+        self.logger.warning(f"DEBUG: _series: result={result}")
         return result
 
 
@@ -939,11 +956,29 @@ class Database(SmartPlugin):
         return func, expression
 
 
-    def _finalize(self, func, tuples):
+    def _finalize(self, func, tuples, tuples_extended = None):
+        """
+        This function rearanges data tuples based on the specified function. 
+        For function of type diff, the combined data series inside tuples and optionally tuples_extended are differentiated.
+        The result is returned as one tuple
+
+        :param func: Function type that defines that action type. Allowed types are: 'diff'
+        :param tuples: Data tuples (time, datapoint) of the regular database values
+        :param tuples_extended: Data tuples (time, datapoint) of additional values, e.g. current value
+        :return: modified data tuples modified according to specified function type.
+        """
+
         if func == 'diff':
             final_tuples = []
             for i in range(1, len(tuples) - 1):
                 final_tuples.append((tuples[i][0], tuples[i][1] - tuples[i - 1][1]))
+
+            # Check if optional current value is available in the extended tuples struct and append final differentiated value:
+            if tuples_extended and len(tuples_extended) >= 1:
+                index = len(tuples)
+                self.logger.warning(f"DEBUG: finalize/diff: Cal last diff value {tuples[len(tuples)][1] - tuples_extended[0][1]} for time {tuples[index][0]}") 
+                final_tuples.append((tuples[index][0], tuples[len(tuples)][1] - tuples_extended[0][1]))
+
             return final_tuples
         else:
             return tuples
