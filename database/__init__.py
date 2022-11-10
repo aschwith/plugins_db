@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # vim: set encoding=utf-8 tabstop=4 softtabstop=4 shiftwidth=4 expandtab
 #########################################################################
-#  Copyright 2016-     Oliver Hinckel                  github@ollisnet.de
+#  Copyright 2016-2018  Oliver Hinckel                  github@ollisnet.de
+#  Copyright 2022-      aschwith
 #  Based on ideas of sqlite plugin by Marcus Popp marcus@popp.mx
 #########################################################################
 #  This file is part of SmartHomeNG.
@@ -819,18 +820,27 @@ class Database(SmartPlugin):
         return it to the visu
 
         :param func:
-        :param start:
-        :param end:
-        :param count:
+        :param start: Starting point of requested time series, e.g. 2w means two weeks ago from now.
+        :param end: Ending point of requested time series, e.g. 1w means one week ago from now. By default, end is set to now
+        :param count: Integer number of requested data intervals
         :param ratio:
-        :param update:
+        :param update: Bool flag indicating if series is requested for the first time (update == False) or on item update (update == True)
         :param step:
         :param sid:
-        :param item:
+        :param item: item for which time series is requested.
 
         :return: data structure in the form needed by the websocket plugin return it to the visu
         """
-        #self.logger.warning("_series: item={}, func={}, start={}, end={}, count={}".format(item, func, start, end, count))
+        if update:
+            self.logger.warning(f"DEBUG _series: called for item={item} with update == True")
+
+        self.logger.warning("_series: item={}, func={}, start={}, end={}, count={}".format(item, func, start, end, count))
+
+        debug_output = False
+        if item in ['']:
+            debug_output = True
+            
+
         init = not update
         if sid is None:
             sid = item + '|' + func + '|' + str(start) + '|' + str(end) + '|' + str(count)
@@ -860,37 +870,74 @@ class Database(SmartPlugin):
         # create tuples containing regular series data from DB query
         tuples = logs['tuples']
         # create tuples_extended containing special datapoints such as
-        # the current value at index 0.
+        # the value at the time of the last item change:
         tuples_extended = []
 
-        # Analyse this section:
-        sample_interval = (logs['iend'] - logs['istart']) / int(count)
-        self.logger.warning(f"DEBUG 1 _series: sample_interval {sample_interval}, logs['istart'] {logs['istart']}, logs['iend'] {logs['iend']}, count {count}")
+        if debug_output:
+            self.logger.warning(f"DEBUG 1a _series: logs['istart'] {logs['istart']}, logs['iend'] {logs['iend']}, logs['step'] {logs['step']}, logs['count'] {logs['count']}")
 
-        if tuples:
-            if logs['istart'] > tuples[0][0]:
-                self.logger.warning(f"DEBUG 2a _series: item={item}, overwriting first tuple[0] from ({tuples[0][1]},{tuples[0][1]}) to ({logs['istart']}, {tuples[0][1]})")
-                tuples[0] = (logs['istart'], tuples[0][1])
-            if end != 'now':
-                self.logger.warning(f"DEBUG 2b _series: item={item}, adding tuple ({logs['iend']}, {tuples[-1][1]})")
-                tuples.append((logs['iend'], tuples[-1][1]))
-        else:
+        if not tuples:
             tuples = []
 
-        # To complete the series, append the current value to extended tuples if item change is within
+
+        #if tuples:
+            # Data series are requested for times between istart and iend.
+            # If first DB return value timestamp is before istart, clip DB timestamp to istart and leave DB value as it is.
+            # According to user wvhn, this is not necessary for smartVisu, as values outside the plot interval are clipped by highcharts.
+            #if logs['istart'] > tuples[0][0]:
+            #    if debug_output:
+            #        self.logger.warning(f"DEBUG 2a _series: item={item}, overwriting first tuple[0] from ({tuples[0][0]},{tuples[0][1]}) to ({logs['istart']}, {tuples[0][1]})")
+                # original implementation
+                # tuples[0] = (logs['istart'], tuples[0][1])
+                # new implementation in sample interval in order to keep the time difference between samples the same:
+                #tuples[0] = (tuples[0][0] - int(logs['step']), tuples[0][1])
+
+            # This section doubles and appends the last db value for the end of the request time span (iend) Explanation: tuples[-1][1] is last value in tuple array.
+            # This is done to make sure that the plot reaches the end (iend) and does not stop before.
+            #if end != 'now':
+            #    self.logger.warning(f"DEBUG 2b _series: item={item}, adding tuple ({logs['iend']}, {tuples[-1][1]})")
+            #    tuples.append((logs['iend'], tuples[-1][1]))
+        #else:
+        #    tuples = []
+
+        # To complete the series, append the current value to extended tuples (later series_ext) if item change is within
         # the request interval (istart, iend)
         item_change = self._timestamp(logs['item'].last_change())
+        value = float(logs['item']())
+
         if item_change < logs['iend']:
-            value = float(logs['item']())
+            if debug_output:
+                self.logger.warning(f"DEBUG 4a: item_change < logs[iend]: item_change {item_change}, logs[iend] {logs['iend']}")
             if item_change < logs['istart']:
+                if debug_output:
+                    self.logger.warning(f"DEBUG 4b: item_change < logs[istart]: appending tuple {logs['istart'], value}")
                 #tuples.append((logs['istart'], value))
-                tuples_extended.append((logs['istart'], value))
-            elif init:
-                #tuples.append((item_change, value))
+                #if last item change was even before start of the requested interval, append value to extended tuples for interpolation purposes on visu side.
                 tuples_extended.append((item_change, value))
-            if init:
+            #This section is no longer enabled:
+            #elif init:
+            #    # This section augments the resolution by adding the explicit item change time and value it change happened between istart and iend.
+            #    if item_change != tuples[len(tuples)-1][0]:
+            #        if debug_output:
+            #            self.logger.warning(f"DEBUG 4c: item_change < logs[iend] and item==True: appending tuple {item_change, value}")
+            #        #tuples.append((item_change, value))
+            #        tuples_extended.append((item_change, value))
+            #    elif debug_output:
+            #        self.logger.warning(f"DEBUG 4c: init==True, no tuple appended as item_change == last timestamp in tuple")
+            
+            # Append current value at end of requested time span if series is calculated for the first time (init == True)
+            # and item change is before the end of the request interval:
+            # Additionally, do not append value if it is the same as the last tuple in the regular series to avoid double entries.
+            elif init and item_change != tuples[len(tuples)-1][0]:
+                if debug_output:
+                    self.logger.warning(f"DEBUG 4e: init==True: appending tuple {logs['iend'], value}")
                 #tuples.append((logs['iend'], value))
-                tuples_extended.append((logs['iend'], value))
+                tuples_extended.append((item_change, value))
+        
+        if init:
+            if item_change != logs['iend'] and logs['iend'] != tuples[len(tuples)-1][0]:
+                # Artificially double last item change value at the end of the request interval to fill the gap and make sure, there are values until the end of the request interval:
+                    tuples_extended.append((logs['iend'], value))
 
         if expression['finalizer']:
             tuples = self._finalize(expression['finalizer'], tuples, tuples_extended)
@@ -901,7 +948,29 @@ class Database(SmartPlugin):
                        'step': logs['step'], 'sid': sid},
             'update': self.shtime.now() + datetime.timedelta(seconds=int(logs['step'] / 1000))
         }
-        self.logger.warning(f"DEBUG: _series: result={result}")
+
+        # Print tuples for Debugging:
+        if debug_output: 
+            self.logger.warning(f"DEBUG: output _series for item {item}, with {len(tuples)} datapoints:")
+            for i in range(0, len(tuples)):
+                if i > 0:
+                    time_diff = tuples[i][0] - tuples[i-1][0]
+                    self.logger.warning(f"DEBUG: index {i}, diff={time_diff}, {tuples[i][0], tuples[i][1]}")
+                else:
+                    self.logger.warning(f"DEBUG: index {i}, {tuples[i][0], tuples[i][1]}")
+               
+            if len(tuples_extended) > 0:
+                self.logger.warning(f"DEBUG: output series_ext:")
+                for i in range(0, len(tuples_extended)):
+                    if i > 0:
+                        time_diff = tuples_extended[i][0] - tuples_extended[i-1][0]
+                        self.logger.warning(f"DEBUG: index {i}, diff={time_diff}, {tuples_extended[i][0], tuples_extended[i][1]}")
+                    else:
+                        time_diff = tuples_extended[i][0] - tuples[len(tuples)-1][0]
+                        self.logger.warning(f"DEBUG: index {i}, diff={time_diff}, {tuples_extended[i][0], tuples_extended[i][1]}")
+
+        self.logger.debug(f"DEBUG: _series: result={result}")
+        #self.logger.warning(f"DEBUG: _series: result={result}")
         return result
 
 
